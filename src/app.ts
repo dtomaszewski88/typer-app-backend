@@ -60,26 +60,32 @@ app.get("/words", function (req, res) {
 
 const getWords = (words: ReadonlyArray<string>) => _.slice(words, 0, 2);
 
+type PlayerEntry = {
+  id: string;
+  name: string;
+  isReady: boolean;
+  currentText: string;
+  currentWordIndex: number;
+  score: number;
+};
+
 type Game = {
   id: string;
   words: ReadonlyArray<string>;
   startTime: number;
   players: {
-    [key: string]: {
-      id: string;
-      isReady: boolean;
-      currentText: string;
-      currentWordIndex: number;
-      score: number;
-    };
+    [key: string]: PlayerEntry;
   };
 };
+
 type GameSet = {
   [key: string]: Game;
 };
 
-let quickGameQueue: Array<string> = [];
-let currentQuickGames: GameSet = {};
+type PlayerQueueEntry = {
+  id: string;
+  name: string;
+};
 
 const apiServer = app.listen(API_PORT, function () {
   console.log(`Listening on port ${API_PORT}`);
@@ -89,17 +95,21 @@ const apiServer = app.listen(API_PORT, function () {
 // Socket setup
 const io = new Server(apiServer, {
   cors: {
-    origin: "http://localhost:3000",
+    origin: `http://localhost:${API_PORT}`,
     methods: ["GET", "POST"],
   },
 });
 
 const QUEUE_CHECK_INTERVAL = 1000;
+let playerQueue: Array<PlayerQueueEntry> = [];
+let currentQuickGames: GameSet = {};
+let gameHistory: Array<Game> = [];
+let gameIdByPlayerId: { [key: string]: string } = {};
 
-const createGame = (playerIds: string[]) => {
-  const players = _.chain(playerIds)
-    .map((playerId) => ({
-      id: playerId,
+const createGame = (matchedPlayers: ReadonlyArray<PlayerQueueEntry>) => {
+  const players = _.chain(matchedPlayers)
+    .map((player) => ({
+      ...player,
       isReady: false,
       currentText: "",
       currentWordIndex: 0,
@@ -119,8 +129,6 @@ const calcScore = (word: string, time: number, errors = 0) => {
   const timeInSec = time / 1000;
   const minScore = word.length * 500;
   const maxScore = Math.round((minScore * 5) / timeInSec - errors * 100);
-  console.log(minScore, maxScore, timeInSec);
-  // return minScore;
   return Math.max(minScore, maxScore);
 };
 
@@ -141,14 +149,14 @@ const setText = (game: Game, playerId: string, text: string) => {
   game.players[playerId].currentText = text;
 };
 
-const completeWord = (game: Game, playerId: string) => {
+const completeWord = (game: Game, playerId: string, errors: number) => {
   const currentTime = Date.now();
   const timeDiff = currentTime - game.startTime;
   const playerGame = game.players[playerId];
   const wordIndex = playerGame.currentWordIndex;
   const currentWord = game.words[wordIndex];
 
-  playerGame.score = calcScore(currentWord, timeDiff);
+  playerGame.score += calcScore(currentWord, timeDiff, errors);
   playerGame.currentText = "";
   playerGame.currentWordIndex++;
 };
@@ -157,57 +165,71 @@ const startGame = (game: Game) => {
   game.startTime = Date.now();
 };
 
+const getGameRoomId = (gameId: string) => `game-${gameId}`;
+
+const PLAYERS = 3;
 const checkGameQueue = () => {
-  if (quickGameQueue.length >= 2) {
-    const [playerId1, playerId2, ...rest] = quickGameQueue;
-    const game = createGame([playerId1, playerId2]);
+  if (playerQueue.length >= PLAYERS) {
+    const matchedPlayers = _.slice(playerQueue, 0, PLAYERS);
+    const matchedPlayersIds = _.map(matchedPlayers, "id");
+    const remainingPlayers = _.slice(playerQueue, PLAYERS);
+
+    const game = createGame(matchedPlayers);
     currentQuickGames[game.id] = game;
-    const gameRoomId = `game-${game.id}`;
-    io.in([playerId1, playerId2]).socketsJoin(gameRoomId);
+    const gameRoomId = getGameRoomId(game.id);
+
+    _.forEach(
+      matchedPlayersIds,
+      (playerId) => (gameIdByPlayerId[playerId] = game.id)
+    );
+    io.in(matchedPlayersIds).socketsJoin(gameRoomId);
     io.to(gameRoomId).emit("gameSearchSuccess", game);
-    quickGameQueue = rest;
+    playerQueue = remainingPlayers;
   }
 };
 
 const queueCheckInterval = setInterval(checkGameQueue, QUEUE_CHECK_INTERVAL);
 
 io.on("connection", function (socket: Socket) {
-  console.log("Made socket connection", socket.id);
   socket.on("updateLocalText", ({ gameId, currentText }) => {
     const game = currentQuickGames[gameId];
-    const gameRoomId = `game-${gameId}`;
+    const gameRoomId = getGameRoomId(gameId);
     setText(game, socket.id, currentText);
     socket.to(gameRoomId).emit("gameUpdate", game);
-    // console.log("updateLocalText", gameId, currentText);
   });
-  socket.on("completeWord", ({ gameId }) => {
+
+  socket.on("completeWord", ({ gameId, errors }) => {
     const game = currentQuickGames[gameId];
-    const gameRoomId = `game-${gameId}`;
-    completeWord(game, socket.id);
-    console.log("IS OVER", isGameOver(game));
+    const gameRoomId = getGameRoomId(gameId);
+    completeWord(game, socket.id, errors);
     if (isGameOver(game)) {
       io.in(gameRoomId).emit("gameOver", game);
     } else {
-      socket.to(gameRoomId).emit("gameUpdate", game);
+      io.in(gameRoomId).emit("gameUpdate", game);
     }
   });
-  socket.on("gameSearchInit", (data) => {
-    quickGameQueue.push(socket.id);
-    // console.log("gameSearchInit", data);
+
+  socket.on("gameSearchInit", ({ name }) => {
+    playerQueue.push({ id: socket.id, name });
   });
+
   socket.on("playerReadyInit", ({ gameId }) => {
     const game = currentQuickGames[gameId];
-    const gameRoomId = `game-${gameId}`;
+    const gameRoomId = getGameRoomId(gameId);
     setPlayerReady(game, socket.id);
     socket.join(gameRoomId);
+
     if (isGameReady(game)) {
       startGame(game);
       io.to(gameRoomId).emit("gameReadySuccess", game);
     }
   });
+
   socket.on("disconnect", () => {
+    const gameId = gameIdByPlayerId[socket.id];
+    const gameRoomId = getGameRoomId(gameId);
     console.log("disconnect");
-    io.emit("user disconnected", socket.id);
+    io.in(gameRoomId).emit("playerDisconnected", socket.id, gameRoomId);
   });
 });
 
